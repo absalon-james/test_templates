@@ -1,0 +1,168 @@
+heat_template_version: 2015-04-30
+
+description: |
+  Designed to test that the softwareconfig/softwaredeployment resources work.
+  Will need an image with heat agents baked in in addition to a correct heat configuration.
+
+parameter_groups:
+  - label: Sizing and location
+    description: What networks and how large of a vm.
+    parameters:
+      - keyname
+      - image
+      - flavor
+      - floating-network
+  - label: Orchestration API
+    description: How to find the orchestration api.
+    parameters:
+      - orchestration_api_location
+      - orchestration_api_port
+
+parameters:
+
+  keyname:
+    type: string
+    label: SSH Keypair name.
+    description: Name of the ssh key used to ssh into mysql server.
+
+  image:
+    type: string
+    label: Image Name
+    description: Name of the trusty image that contains software config heat elements.
+
+  flavor:
+    type: string
+    label: Flavor
+    description: Flavor (size) for all virtual machines in this stack.
+    default: m1.small
+
+  private-network:
+    type: string
+    label: Private network for server
+    description: The private network to use
+
+  floating-network:
+    type: string
+    label: External Network Name or UUID
+    description: The private network created by this stack will route to this network.
+    default: changeme
+
+  orchestration_api_location:
+    type: string
+    label: Orchestration API Location
+    description: Where to find the orchestration api. This will be used to make a self signed cert trusted.
+
+  orchestration_api_port:
+    type: string
+    label: Orchestration API Port
+    description: Port of the orchestration api. This will be used to make a self signed cert trusted.
+    default: 8004
+
+resources:
+
+  # One floating ip for the salt-master node
+  test-server-ip:
+    type: OS::Neutron::FloatingIP
+    properties:
+      floating_network:
+        get_param: floating-network
+
+  # One port for the ambari-server/salt-master node
+  test-server-port:
+    type: OS::Neutron::Port
+    properties:
+      name: test-stack-server-port
+      network_id:
+        get_param: private-network
+
+  cert_init:
+    type: OS::Heat::SoftwareConfig
+    properties:
+      group: ungrouped
+      config: 
+       str_replace:
+         params:
+           $LOCATION:
+             get_param: orchestration_api_location
+           $PORT:
+             get_param: orchestration_api_port
+         template: |
+           #!/bin/bash
+           CERT_NAME="/opt/heat.crt"
+           echo -n | openssl s_client -connect $LOCATION:$PORT | sed -ne '/-BEGIN CERTIFICATE-/,/-END CERTIFICATE-/p' > ${CERT_NAME}
+
+           cat ${CERT_NAME} >> /opt/stack/venvs/os-collect-config/lib/python2.7/site-packages/requests/cacert.pem
+           cat ${CERT_NAME} >> /usr/local/lib/python2.7/dist-packages/requests/cacert.pem
+           cat ${CERT_NAME} >> /etc/ssl/certs/ca-certificates.crt
+           rm ${CERT_NAME}
+           touch /opt/cert_finished
+  
+  # Software configuration script for the salt-master
+  config-test:
+    type: OS::Heat::SoftwareConfig
+    properties:
+      group: script
+      config: |
+        #!/bin/bash
+        touch /opt/itworked
+
+
+  # Software deployment for salt-master. Deploys the salt-master software
+  # configuration.
+  deploy-test:
+    type: OS::Heat::SoftwareDeployment
+    properties:
+      config:
+        get_resource: config-test
+      server:
+        get_resource: test-server
+
+  # The salt master instance
+  # Should have one floating ip
+  test-server:
+    type: OS::Nova::Server
+    properties:
+      # config_drive: True
+      key_name:
+        get_param: keyname
+      image:
+        get_param: image
+      flavor:
+        get_param: flavor
+      name: test-server
+
+      # Get access from the master-port
+      networks:
+        - port:
+            get_resource: test-server-port
+
+      # Using SoftwareConfigs - This needs to be set to SOFTWARE_CONFIG
+      user_data_format: SOFTWARE_CONFIG
+      user_data:
+        get_resource: cert_init
+
+  test-server-floating-ip-ass:
+    type: OS::Neutron::FloatingIPAssociation
+    properties:
+      floatingip_id:
+        get_resource: test-server-ip
+      port_id:
+        get_resource: test-server-port
+outputs:
+  test-server-ip:
+    description: The ip address of the test server.
+    value:
+      get_attr:
+        - test-server-ip
+        - floating_ip_address
+
+  ssh_access:
+    description: How to ssh into the stack.
+    value:
+      str_replace:
+        template: ssh ubuntu@$test-server-ip$
+        params:
+          $test-server-ip$:
+            get_attr:
+              - test-server-ip
+              - floating_ip_address
